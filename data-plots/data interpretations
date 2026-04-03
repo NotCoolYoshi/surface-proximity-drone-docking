@@ -1,0 +1,401 @@
+================================================================================
+SIMULATION PLOT EXPLANATIONS
+Surface-Proximate Drone Docking Project — Sean Dai
+================================================================================
+
+This file documents every plot produced during Phases 1 and 2 of the simulation.
+Each plot has explanations on what it shows, which script produced it, what the key findings
+are, and any unexpected or noteworthy data points I encountered when conducting virtual simulations. 
+
+--------------------------------------------------------------------------------
+PLOT 1: hover_error.png — Hover Position Error
+--------------------------------------------------------------------------------
+
+WHAT IT SHOWS
+Two-panel figure. Top panel: absolute x-axis (horizontal) position error over
+15 seconds. Bottom panel: absolute z-axis (vertical) position error over the
+same window. Both panels mark the 5 cm success threshold as a green shaded
+band.
+
+SCRIPT
+Produced by visualize.py → plot_hover_error()
+Data source: Experiment 1 (run_sim.py, exp1_hover_nowall block)
+Wall disturbance: OFF. Target: (x=1.0m, z=1.5m). Start: (x=1.2m, z=1.5m).
+
+FINDINGS
+The controller passes the Phase 1 success criterion. z-error converges to below
+5 cm almost immediately (within the first 0.5 seconds) and stays there for the
+full run — the cascaded PD controller handles altitude trivially. x-error starts
+at 0.20m and decays gradually, entering the 5 cm band at around t=8s and
+continuing to converge toward ~1 cm by t=15s. No sustained oscillation in
+either axis.
+
+UNEXPECTED / NOTEWORTHY
+The x-error convergence is visibly slower than z-error and shows a mild
+overdamped shape rather than a sharp exponential decay. This is because the
+horizontal channel uses high derivative gain (kd_x=10.0) which slows the
+approach to reduce overshoot: a deliberate design choice to prevent the drone
+from overshooting the target position and getting too close to the wall. The
+asymmetry between x and z convergence rates is expected but striking visually.
+
+The z-error being essentially zero from t=0 is because the drone starts at
+z=1.5m, which is already the target altitude, so the controller has no altitude
+error to correct. The tiny residual visible at the start is numerical noise from
+the RK45 integrator initialising.
+
+--------------------------------------------------------------------------------
+PLOT 2: trajectory.png — Drone Trajectory (x and z over time)
+--------------------------------------------------------------------------------
+
+WHAT IT SHOWS
+Two-panel figure. Top panel: x position (horizontal, toward wall) over 30
+seconds with the wall and d_min marked as reference lines. Bottom panel: z
+position (vertical altitude) over the same window.
+
+SCRIPT
+Produced by visualize.py → plot_trajectory()
+Data source: Likely from a near-wall hover or approach experiment (Experiment 2
+or 3). Wall disturbance: ON.
+
+FINDINGS
+The x trajectory shows the drone approaching the wall from x=1.5m, reaching
+a maximum of about x=1.85m (d=0.15m from wall), then oscillating. The
+oscillations are caused by the wall disturbance model where the attractive force
+pulls the drone toward the wall, the controller pushes back, producing a
+limit-cycle oscillation that neither grows nor decays. The drone never
+crosses d_min (x=1.95m), confirming the physical safety boundary is respected
+in this run.
+
+The z trajectory is interesting: it shows a slow monotonic rise from z=1.50m to
+z=1.62m over the first 15 seconds, then similar gentle oscillation around
+1.60m. This vertical drift is caused by the wall's thrust modification
+(Gamma > 1.0): the wall boosts effective thrust, so the same thrust command
+produces more lift, pushing the drone slightly upward. The controller corrects
+for this but with some steady-state offset due to the finite integral gain.
+
+UNEXPECTED / NOTEWORTHY
+The slow upward vertical drift was not immediately obvious from the equations.
+It is a direct consequence of Gamma(d) > 1. When the drone is near the wall,
+the effective thrust exceeds commanded thrust, and the altitude loop sees this
+as excess lift. In hardware, this will appear as an altitude creep when hovering
+near a wall, which the PX4 controller will need to compensate. This is one of
+the key reasons why the disturbance residual sub-margin Mr exists in my project — it captures
+exactly this discrepancy between commanded and effective thrust.
+
+--------------------------------------------------------------------------------
+PLOT 3: disturbance.png — Wall Disturbance Model
+--------------------------------------------------------------------------------
+
+WHAT IT SHOWS
+Two-panel figure. Top panel: wall disturbance force f_wall (N) plotted against
+wall distance d (m). Bottom panel: thrust modification factor Gamma(d) plotted
+against wall distance.
+
+Note: the top panel shows a loop/orbit pattern rather than a clean curve
+because it is plotted parametrically from a time-series run: the drone
+oscillates back and forth near the wall, tracing the same force-distance
+relationship repeatedly in both directions with slightly different velocities
+each pass (due to vn-dependent terms in the disturbance model).
+
+SCRIPT
+Produced by visualize.py → plot_disturbance()
+Data source: Near-wall experiment with wall disturbance ON.
+
+FINDINGS
+f_wall is consistently negative (attractive toward wall) at all distances shown
+(0.25m to 0.48m). The force magnitude ranges from about -0.3N to -0.5N in this
+distance band. This confirms the pressure-attraction term (c0) dominates at
+these distances.
+
+Gamma ranges from about 1.071 at d=0.47m to 1.101 at d=0.27m — an
+approximately 10% thrust boost at the closest approach distance. This is modest
+but not negligible: at m=1.0kg hover thrust of 9.81N, a 10% boost means 0.98N
+of extra lift that the controller must counteract.
+
+UNEXPECTED / NOTEWORTHY
+The loop pattern in the top panel is genuinely interesting. The orbit shape
+(wider on the left at closer distances, narrower on the right) shows that the
+hysteresis in the disturbance force depends on approach direction. When the
+drone is closing (negative vn), the viscous damping term c1 adds to the
+attractive force, making it stronger. When retreating (positive vn), the same
+term subtracts, making the force weaker. This creates the asymmetric orbit
+shape visible in the plot. This hysteresis is physically real and will appear
+in hardware measurements — it means the system identification experiment for
+c0, c1, c2 must be done in both approach and retreat directions to capture the
+full model.
+
+--------------------------------------------------------------------------------
+PLOT 4: margins.png — Dockability Margin and Six Sub-Margins
+--------------------------------------------------------------------------------
+
+WHAT IT SHOWS
+Two-panel figure. Top panel: all six individual sub-margins (Md, Mv, Mdelta,
+Momega, Mu, Mr) plotted over 30 seconds, colour-coded. Bottom panel: the
+overall Dockability Margin M = min of all six, with M_safe, M_dock, and
+M_abort threshold lines marked.
+
+SCRIPT
+Produced by visualize.py → plot_margins()
+Data source: Near-wall approach or oscillation experiment.
+
+FINDINGS
+The overall M oscillates between about 0.15 and 0.70 over the 30 second window,
+corresponding to the drone oscillating near the wall. The dominant sub-margin
+(the one that most frequently sets the minimum) is Md (clearance, blue). It
+drops sharply as the drone approaches and recovers as it retreats, driving most
+of the M oscillation.
+
+Mu (control authority, purple) is notably flat around 0.73-0.75 throughout.
+This is because T_max = 4*m*g in the simulation, giving 75% headroom at hover
+thrust. Notice how the control authority margin is rarely the limiting factor.
+
+Mr (disturbance residual, grey) shows a slow decay from about 0.67 to 0.58
+over the run, reflecting the accumulating effect of wall disturbance as the
+drone spends more time near the surface.
+
+UNEXPECTED / NOTEWORTHY FINDINGS
+Momega (angular rate, dark red) shows brief sharp dips that do not correlate
+with the x-position oscillation frequency. These spikes correspond to rapid
+attitude corrections the controller makes when the wall force perturbs the
+drone sideways: the inner attitude loop fires a large correction, producing
+a high instantaneous theta_dot that momentarily drops Momega close to 0. This
+is a genuine instability signature that the CBF angular rate damping (Layer 3b)
+is designed to suppress.
+
+The plot also shows M briefly touching the M_abort line at around t=14s and
+t=26s without triggering abort — this is correct behavior in a No-CBF run
+where the abort handler is not active. In a CBF-enabled run, these touches
+would trigger a retreat.
+
+--------------------------------------------------------------------------------
+PLOT 5: modes.png — State Machine Modes and CBF Intervention
+--------------------------------------------------------------------------------
+
+WHAT IT SHOWS
+Two-panel figure. Top panel: overall M(t) with coloured background bands showing
+the active state machine mode at each time (green=free, yellow=surface,
+orange=docking, red=abort). Threshold lines at M_safe, M_dock, M_abort.
+Bottom panel: nominal thrust T_nom vs CBF-filtered thrust T_safe, with red
+shading where CBF was active.
+
+SCRIPT
+Produced by visualize.py → plot_modes()
+Data source: CBF-enabled run, likely from an approach or oscillation experiment.
+
+FINDINGS
+The state machine transitions are clearly visible as colour bands in the top
+panel. The drone begins in surface mode (yellow, M just below 0.6), spends
+most of the run oscillating between surface (yellow) and docking (orange) modes,
+and briefly touches abort (red) at two points where M drops below 0.15.
+
+In the bottom panel, T_nom and T_safe are nearly identical for the entire run —
+the red CBF-active shading is very sparse or absent. This confirms the permissive
+CBF design: the filter only activates when a specific instability threshold is
+crossed, not continuously during proximity operation.
+
+UNEXPECTED / NOTEWORTHY
+The thrust range in the bottom panel (8.75N to 9.81N) is lower than expected
+naive hover thrust. This is the Gamma effect again — the wall boost means the
+controller consistently commands less thrust than m*g to compensate for the
+extra lift. This is correct physics but it means T_nom runs below the nominal
+hover value for the entire near-wall portion of the experiment. If you saw this
+pattern in hardware and didn't know about Gamma, it would look like the battery
+was depleting (a useful diagnostic to be aware of!).
+
+The abort mode (red background) appearing only briefly and then recovering
+immediately to free mode (green) after the retreat confirms the state machine
+hysteresis is working correctly. Once M rises above M_safe + 0.05 the system
+exits abort cleanly.
+
+--------------------------------------------------------------------------------
+PLOT 6: exp4_comparison.png — Experiment 4: Disturbance Strength Sensitivity
+--------------------------------------------------------------------------------
+
+WHAT IT SHOWS
+Single panel: M(t) for three runs with identical approach trajectory but
+different wall disturbance coefficients.
+  - Green: No disturbance (c0=c1=c2=0)
+  - Blue:  Default disturbance (c0=0.8, c1=0.3, c2=0.1)
+  - Red:   Double disturbance (c0=1.6, c1=0.6, c2=0.2)
+M_safe and M_abort threshold lines shown.
+
+SCRIPT
+Produced from Experiment 4 data (run_sim.py, Experiment 4 block).
+No CBF: isolates the disturbance model's effect on M.
+
+FINDINGS
+The three runs show dramatically different M behavior. The no-disturbance run
+(green) is not visible in the plot, strongly suggesting M was at or near 1.0
+for the entire run (no disturbance means Md is the only sub-margin that drops,
+and the drone stayed far enough from the wall that it remained high).
+
+The default disturbance run (blue) shows a smooth monotonic decay in M from
+about 0.60 down to near 0.05 over 25 seconds. This is a clean result as
+M decreases steadily as the drone approaches and the disturbance grows.
+
+The double disturbance run (red) shows violent oscillations with M swinging
+between 0.30 and 0.73 throughout the run, spending most time between M_safe
+and M_dock. It never reaches M_abort.
+
+UNEXPECTED / NOTEWORTHY FINDINGS
+The double disturbance run behaving MORE stably than the default (blue) run
+is counterintuitive. The reason: with double the disturbance coefficients, the
+wall force is much stronger, and the controller is pushed harder (but it also
+recovers harder to the point that it is extreme). The drone doesn't get as close 
+to the wall because the stronger attractive force is balanced by stronger controller
+response, producing a limit-cycle at a larger distance. The default disturbance is 
+in a regime where the drone slowly drifts toward the wall without triggering a 
+strong enough controller response to oscillate (it just keeps getting closer).
+
+This finding has a direct hardware implication: if the real wall disturbance
+coefficients are larger than the simulation estimates, the system may actually
+be safer rather than more dangerous, because stronger wall forces produce more
+obvious perturbations that the controller can respond to. The dangerous regime
+is moderate disturbances that push slowly and consistently without triggering
+oscillatory corrections.
+
+--------------------------------------------------------------------------------
+PLOT 7: exp7_permissive_cbf.png — Experiment 7 Initial (Permissive Redesign)
+--------------------------------------------------------------------------------
+
+WHAT IT SHOWS
+Two-panel comparison: x(t) top, M(t) bottom. Red = No-CBF, Blue = CBF enabled.
+This was the first version of the corrected CBF design with the permissive
+architecture, prior to the progressive speed limiting redesign.
+
+SCRIPT
+run_sim.py Experiment 7, initial permissive CBF version.
+cbf.py with the permissive Layer 3 corrections but before the progressive
+speed limiting was added to Layer 3a.
+
+FINDINGS
+The top panel shows red (No-CBF) oscillating near x=1.5-1.8m, staying close to
+the wall. Blue (CBF) retreats to x=0.0m after abort fires at around t=7-8s and
+then oscillates near x=0 for the rest of the run.
+
+The bottom panel shows red M oscillating between 0.05 and 0.30 — deep in the
+danger zone. Blue M drops to around 0.15, abort fires, retreats, and then
+stabilises at M≈0.73 for the rest of the run after the drone is safely at
+x=0.0m.
+
+FINDINGS
+The CBF successfully prevented wall collision and M recovered. The abort and
+retreat mechanism worked.
+
+UNEXPECTED / NOTEWORTHY
+This plot exposed the key design flaw that led to the final redesign. After
+retreat, blue stays near x=0.0m for the rest of the simulation (it never
+re-approaches the wall). This is wrong by design intent. The abort retreat
+should return the drone to the d_safe boundary, allow M to recover, and then
+let the controller resume its approach. Instead, the retreat target was set to
+x_retreat = wall_x - d_safe = 0.0m and the controller never got a signal to
+re-approach after recovery.
+
+This led directly to the progressive speed limiting redesign: instead of
+relying on abort to prevent collapse, slow the approach progressively so the
+drone can approach the wall deliberately without M collapsing, only triggering
+abort for genuine instability. The blue curve sitting at x=0 for 25+ seconds
+in this plot was the visual evidence that the design was treating the abort as
+a terminal state rather than a transient safety event.
+
+--------------------------------------------------------------------------------
+PLOT 8: exp7_comparison.png — Experiment 7 Intermediate Version
+--------------------------------------------------------------------------------
+
+WHAT IT SHOWS
+Two-panel comparison: x(t) top, M(t) bottom. Red = No-CBF, Blue = CBF enabled.
+This is an intermediate iteration of Experiment 7, after a decent amount of fixes but before
+the final progressive speed limiting redesign.
+
+SCRIPT
+run_sim.py Experiment 7, intermediate version.
+An earlier version of cbf.py before the Layer 3a progressive limit was
+fully implemented.
+
+FINDINGS
+Both runs show oscillation near x=1.4-1.85m: neither drone is staying very
+close to the wall. The M curves show both oscillating between about 0.15 and
+0.75 in a similar pattern. The two runs look more similar than different in this
+version, suggesting CBF corrections were firing but not producing strong
+enough differentiation from No-CBF behavior.
+
+The red run touches M_abort briefly (around t=21s) with no retreat — confirming
+No-CBF safety action is correctly disabled. The blue run also dips near M_abort
+without retreating cleanly in some iterations.
+
+UNEXPECTED / NOTEWORTHY FINDINGS
+The similarity of the red and blue curves in this intermediate version was the
+diagnostic that revealed the approach speed problem. When the two runs look
+nearly the same, it means the CBF is either not firing at all (threshold not
+being crossed) or firing so weakly that the physical behavior is unchanged. The
+ramp-target approach speed was below the CBF threshold in this version, which is
+why both curves look nearly identical. This is what motivated switching from a
+ramp target to a fixed target for the final Experiment 7 design — allowing the
+PD controller to accelerate the drone naturally and exceed the CBF threshold.
+
+--------------------------------------------------------------------------------
+PLOT 9: exp7_corrected.png — Experiment 7 Final (Corrected Design)
+--------------------------------------------------------------------------------
+
+WHAT IT SHOWS
+Two-panel comparison: x(t) top, M(t) bottom. Red = No-CBF, Blue = CBF enabled.
+This is the final corrected design with progressive speed limiting in Layer 3a
+and the properly gated abort handler.
+
+SCRIPT
+run_sim.py Experiment 7, final version.
+cbf.py Version 4 with progressive speed limiting in Layer 3a.
+Abort handler gated on cbf_on flag. Fixed-target approach design.
+
+FINDINGS
+Top panel: Both runs are visually identical from t=0 to about t=7s — both
+approach the wall at the same rate to the same position (x≈1.56m). At t≈7s,
+the blue run's abort fires and the drone retreats to x≈0.6m (not all the way
+to x=0.0m as in earlier versions). After retreating, blue oscillates near the
+approach zone. Red has no safety action and continues oscillating near the wall
+for the full 25 seconds.
+
+Bottom panel: Red M oscillates between 0.15 and 0.65 — repeatedly touching and
+crossing M_abort with no consequence. Blue M drops with the approach, abort
+fires just above 0.15, retreats, and M recovers toward 0.6-0.7. The two curves
+diverge cleanly at t≈7s.
+
+UNEXPECTED / NOTEWORTHY
+The numerically identical trajectories before abort fires (max difference
+0.00094m, verified in the verification script) confirm that the permissive CBF
+design is working exactly as intended — it does not interfere with deliberate
+approach. The CBF is truly invisible until the genuine safety boundary is
+approached.
+
+The retreat distance (~1.0m) is notably shorter than the earlier versions where
+the drone retreated all the way to x=0.0m. This is because the retreat target
+is now set to wall_x - d_safe = 0.0m but the drone decelerates naturally before
+reaching it — the controller is working against wall suction and inertia, so it
+settles at a closer-than-target equilibrium. This is physically sensible and not
+a bug, but it means the actual retreat distance is determined by the dynamics
+rather than purely by the target coordinate. In hardware, this means the
+effective retreat distance will depend on the real wall disturbance strength —
+another reason to get accurate c0, c1, c2 values from system identification
+before relying on the abort mechanism in flight tests.
+
+================================================================================
+SUMMARY TABLE
+================================================================================
+
+Plot                  | Phase | Experiment | Key result
+----------------------|-------|------------|------------------------------------------
+hover_error.png       |   1   |     1      | Controller converges <5cm in both axes
+trajectory.png        |   1   |   2 or 3  | Wall suction causes altitude drift
+disturbance.png       |   1   |   2 or 3  | Hysteresis loop in wall force vs distance
+margins.png           |   1   |   2 or 3  | Md dominates M; Momega shows spikes
+modes.png             |   2   |     7      | Sparse CBF intervention; Gamma affects T
+exp4_comparison.png   |   1   |     4      | Stronger disturbance = safer (unexpected)
+exp7_permissive_cbf   |   2   |     7v1    | Abort works; drone stuck at x=0 post-retreat
+exp7_comparison.png   |   2   |     7v2    | CBF and No-CBF nearly identical (threshold miss)
+exp7_corrected.png    |   2   |     7vF    | Identical pre-abort; clean divergence at abort
+
+Png files of failed simulations can be requested through email! 
+
+================================================================================
+END OF FILE
+================================================================================

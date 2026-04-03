@@ -1,0 +1,564 @@
+\documentclass[12pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage{tcolorbox}
+
+\tcbuselibrary{skins, breakable}
+
+\definecolor{codebg}{RGB}{245,245,245}
+\definecolor{notebg}{RGB}{255,248,220}
+\definecolor{successbg}{RGB}{235,255,235}
+\definecolor{warnbg}{RGB}{255,235,235}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue
+}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    backgroundcolor=\color{codebg},
+    frame=single,
+    breaklines=true,
+    keywordstyle=\color{blue},
+    commentstyle=\color{green!60!black},
+    stringstyle=\color{orange},
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+    numbersep=5pt
+}
+
+\newtcolorbox{notebox}{
+    colback=notebg,
+    colframe=orange!70!black,
+    title=\textbf{Note},
+    fonttitle=\small
+}
+
+\newtcolorbox{successbox}{
+    colback=successbg,
+    colframe=green!60!black,
+    title=\textbf{Result},
+    fonttitle=\small
+}
+
+\newtcolorbox{warnbox}{
+    colback=warnbg,
+    colframe=red!70!black,
+    title=\textbf{Challenge},
+    fonttitle=\small
+}
+
+\title{\textbf{Phase 2 Simulation Report} \\
+\large CBF Safety Filter and Hybrid State Machine \\
+\normalsize Surface-Proximate Drone Docking Project}
+\author{Sean Dai}
+\date{March 14, 2026}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+% -------------------------------------------------------
+\section{Overview}
+% -------------------------------------------------------
+
+Phase 2 added a mathematically rigorous safety layer on top of the
+Phase 1 simulation. The nominal cascaded PD controller from Phase 1
+continues to run unchanged. A new Control Barrier Function (CBF)
+safety filter intercepts the nominal control input and modifies it
+only when necessary to prevent unsafe states. A hybrid state machine
+governs which operating mode the drone is in based on the Dockability
+Margin $M$ calibrated in Phase 1.
+
+\textbf{Phase 2 produced three verified results:}
+
+\begin{enumerate}
+    \item The CBF filter activates at the correct $M$ threshold and
+          modifies control inputs to prevent wall collision.
+    \item The state machine transitions correctly through all four
+          modes during a wall approach.
+    \item The CBF-filtered trajectory handles abort and retreat cycles
+          safely while the unfiltered trajectory remains dangerously
+          close to the wall without recovery.
+\end{enumerate}
+
+% -------------------------------------------------------
+\section{New Dependencies and File Structure}
+% -------------------------------------------------------
+
+\subsection{New Library}
+
+Phase 2 required one new Python library for the quadratic program solver:
+
+\begin{lstlisting}[language=bash, numbers=none]
+pip install cvxpy==1.8.1
+\end{lstlisting}
+
+\subsection{Updated File Structure}
+
+Phase 2 added two new files and modified four existing ones.
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{File} & \textbf{Status} & \textbf{Responsibility} \\
+\midrule
+\texttt{params.py}         & Modified & CBF gains and retreat parameters added \\
+\texttt{dynamics.py}       & Modified & Wall clamp added to prevent wall crossing \\
+\texttt{logger.py}         & Modified & Mode, CBF flag, and T\_nom fields added \\
+\texttt{visualize.py}      & Modified & Mode transition plot added \\
+\texttt{run\_sim.py}       & Modified & CBF and state machine integrated \\
+\texttt{cbf.py}            & New      & CBF safety filter \\
+\texttt{state\_machine.py} & New      & Hybrid docking state machine \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% -------------------------------------------------------
+\section{New Parameters}
+% -------------------------------------------------------
+
+The following parameters were added to \texttt{params.py}:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Parameter} & \textbf{Value} & \textbf{Description} \\
+\midrule
+\texttt{cbf\_gamma\_d}  & 0.5  & Class-$\mathcal{K}$ gain for wall clearance \\
+\texttt{cbf\_gamma\_v}  & 0.5  & Class-$\mathcal{K}$ gain for velocity \\
+\texttt{cbf\_gamma\_th} & 1.0  & Class-$\mathcal{K}$ gain for attitude \\
+\texttt{cbf\_gamma\_u}  & 1.0  & Class-$\mathcal{K}$ gain for actuator \\
+\texttt{x\_retreat}     & 1.5  & Retreat target position (m) \\
+\texttt{retreat\_speed} & 0.05 & Retreat approach speed (m/s) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% -------------------------------------------------------
+\section{State Machine Design}
+% -------------------------------------------------------
+
+\subsection{Four Operating Modes}
+
+The state machine reads $M$ at every timestep and returns one of four
+mode strings. Each mode determines whether the CBF filter is active
+and what target position the controller tracks.
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+\textbf{Mode} & \textbf{Entry condition} & \textbf{CBF} &
+\textbf{Target} \\
+\midrule
+\texttt{free}    & $M \geq M_\mathrm{safe}$   & Off &
+    Approach lambda \\
+\texttt{surface} & $M < M_\mathrm{safe}$      & On  &
+    Approach lambda \\
+\texttt{docking} & $M < M_\mathrm{dock}$      & On  &
+    Approach lambda \\
+\texttt{abort}   & $M < M_\mathrm{abort}$     & On  &
+    $x_\mathrm{retreat}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Hysteresis}
+
+A hysteresis band of 0.05 was implemented to prevent rapid
+mode-switching at threshold boundaries. For example, the drone does
+not re-enter \texttt{free} mode until $M$ rises to
+$M_\mathrm{safe} + 0.05 = 0.65$, not just above 0.6. This prevents
+chattering behavior at threshold crossings.
+
+\subsection{Abort Recovery}
+
+Once abort is triggered, the drone targets $x_\mathrm{retreat}$
+permanently until $M$ recovers above $M_\mathrm{safe} + 0.1 = 0.7$.
+At that point \texttt{abort\_triggered} is reset and the approach
+lambda resumes from the current position. This allows multiple
+approach-abort-retreat cycles within a single simulation run.
+
+\subsection{Verification Test}
+
+\begin{lstlisting}[language=Python]
+from params import PARAMS
+from state_machine import StateMachine
+
+sm = StateMachine(PARAMS)
+state = [1.5, 1.5, 0.0, 0.0, 0.0, 0.0]
+
+print(sm.update(0.8, state, PARAMS))   # free
+print(sm.update(0.5, state, PARAMS))   # surface
+print(sm.update(0.3, state, PARAMS))   # docking
+print(sm.update(0.1, state, PARAMS))   # abort
+\end{lstlisting}
+
+\textbf{Result:} All four modes returned correctly in sequence.
+
+% -------------------------------------------------------
+\section{CBF Safety Filter Design}
+% -------------------------------------------------------
+
+\subsection{Architecture Decision}
+
+The initial CBF design used a \texttt{cvxpy} quadratic program with
+thrust and torque as decision variables. This approach failed because
+at $\theta = 0$ (level hover), $\sin\theta = 0$, making all
+wall-related constraints trivially satisfied regardless of closing
+velocity. The QP had no way to enforce safety through thrust alone
+when the drone is flying level.
+
+The final implementation instead operates at the outer loop level by
+limiting the desired pitch angle based on wall distance and closing
+velocity. Since pitch angle directly controls horizontal acceleration,
+this is the correct level at which to enforce wall safety.
+
+\subsection{Barrier Functions}
+
+Two barrier functions are enforced:
+
+\textbf{Barrier 1 — Wall clearance:}
+\begin{equation}
+    h_d(x) = d - d_{\min} \geq 0
+\end{equation}
+\begin{equation}
+    \dot{h}_d = v_n \geq -\gamma_d(d - d_{\min})
+\end{equation}
+
+\textbf{Barrier 2 — Approach velocity:}
+\begin{equation}
+    h_v(x) = v_{n,\max} + v_n \geq 0
+\end{equation}
+\begin{equation}
+    v_n \geq -v_{n,\max}
+\end{equation}
+
+The combined floor on closing velocity is:
+\begin{equation}
+    v_{n,\mathrm{floor}} = \max\left(-\gamma_d(d - d_{\min}),\;
+    -v_{n,\max}\right)
+\end{equation}
+
+\subsection{Control Law}
+
+If the current $v_n < v_{n,\mathrm{floor}}$, the CBF computes a
+required deceleration and converts it to a safe pitch angle:
+
+\begin{equation}
+    a_{x,\mathrm{req}} = \gamma_d(v_{n,\mathrm{floor}} - v_n)
+\end{equation}
+
+\begin{equation}
+    \theta_\mathrm{safe} = \arcsin\!\left(
+    \mathrm{clip}\!\left(\frac{-a_{x,\mathrm{req}} \cdot m}{T},
+    -1, 1\right)\right)
+\end{equation}
+
+A corrected torque command is then computed using the inner attitude
+loop:
+
+\begin{equation}
+    \tau_\mathrm{safe} = I\left(k_{p,\theta}(\theta_\mathrm{safe}
+    - \theta) + k_{d,\theta}(0 - \dot{\theta})\right)
+\end{equation}
+
+Thrust is left unchanged — the CBF only modifies attitude.
+
+\subsection{Verification Test}
+
+\begin{lstlisting}[language=Python]
+from params import PARAMS
+from cbf import CBFFilter
+
+cbf = CBFFilter(PARAMS)
+
+# Fast approach toward wall: vx = +1.6 m/s
+fast_state = [1.85, 1.5, 1.6, 0.0, 0.0, 0.0]
+T_safe, tau_safe, active = cbf.filter(fast_state, 9.81, 0.0, PARAMS)
+print("CBF active:", active)          # True
+print("tau_safe:", round(tau_safe, 4)) # non-zero
+
+# Static hover: no intervention needed
+static_state = [1.85, 1.5, 0.0, 0.0, 0.0, 0.0]
+T_safe2, tau_safe2, active2 = cbf.filter(static_state, 9.81, 0.0,
+                                          PARAMS)
+print("CBF active:", active2)         # False
+print("T_safe:", round(T_safe2, 4))   # 9.81
+\end{lstlisting}
+
+\textbf{Result:}
+\begin{itemize}
+    \item Fast approach: \texttt{CBF active: True},
+          \texttt{tau\_safe = -0.0178} (corrective torque applied)
+    \item Static hover: \texttt{CBF active: False},
+          \texttt{T\_safe = 9.81} (nominal input passed through)
+\end{itemize}
+
+% -------------------------------------------------------
+\section{Integration into run\_sim.py}
+% -------------------------------------------------------
+
+The \texttt{ode()} inner function was updated to follow this sequence
+at every timestep:
+
+\begin{enumerate}
+    \item Get nominal control $(T_\mathrm{nom}, \tau_\mathrm{nom})$
+          from the Phase 1 controller
+    \item Compute $M$ and sub-margins
+    \item Update state machine to get current mode
+    \item If abort triggered, redirect target to
+          $x_\mathrm{retreat}$ and recompute nominal control
+    \item Apply CBF filter if mode is \texttt{surface},
+          \texttt{docking}, or \texttt{abort}
+    \item Log all quantities including mode and CBF flag
+    \item Return dynamics derivatives using safe control input
+\end{enumerate}
+
+A \texttt{SafeCtrl} helper class was used to pass the safe control
+input into the existing \texttt{derivatives()} function without
+modifying its interface.
+
+% -------------------------------------------------------
+\section{Experiments and Results}
+% -------------------------------------------------------
+
+\subsection{Experiment 5 --- CBF Activation Test}
+
+\textbf{Purpose:} Verify the CBF filter activates at the correct $M$
+threshold and that the full approach-abort-retreat cycle works.
+
+\textbf{Setup:} Approach speed 0.05\,m/s from $x = 1.5$\,m,
+\texttt{cbf\_on=True}, duration 35\,s.
+
+\textbf{Result: PASS.}
+\begin{itemize}
+    \item All four mode transitions observed: \texttt{free} $\to$
+          \texttt{surface} $\to$ \texttt{docking} $\to$
+          \texttt{abort} $\to$ \texttt{free}
+    \item Drone never crossed $d_{\min}$ ($x < 1.95$\,m throughout)
+    \item Abort triggered at $t \approx 20$\,s, drone retreated to
+          $x \approx 1.4$\,m
+    \item $M$ recovered above $M_\mathrm{safe}$ after retreat
+    \item Two complete approach-abort-retreat cycles observed in
+          35 seconds
+\end{itemize}
+
+\subsection{Experiment 6 --- State Machine Transitions}
+
+\textbf{Purpose:} Verify all four mode transitions occur correctly
+under a faster, more aggressive approach.
+
+\textbf{Setup:} Approach speed 0.10\,m/s from $x = 1.5$\,m,
+\texttt{cbf\_on=True}, duration 30\,s.
+
+\textbf{Result: PASS.}
+\begin{itemize}
+    \item Complete mode sequence observed twice within 30 seconds
+    \item Each transition occurred at the correct $M$ threshold
+    \item Drone never crossed $d_{\min}$ despite faster approach
+    \item Two abort retreats visible in trajectory at $t \approx
+          15$\,s and $t \approx 21$\,s
+    \item $M$ recovered above $M_\mathrm{safe}$ after each retreat
+\end{itemize}
+
+\subsection{Experiment 7 --- CBF vs.\ No-CBF Comparison}
+
+\textbf{Purpose:} Quantify the safety benefit of the CBF layer by
+comparing identical approach scenarios with and without CBF.
+
+\textbf{Setup:} Two runs with identical initial conditions
+(approach speed 0.10\,m/s, $x_0 = 1.5$\,m, duration 25\,s):
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Run} & \textbf{cbf\_on} & \textbf{File} \\
+\midrule
+No CBF & False & \texttt{exp7\_no\_cbf} \\
+CBF    & True  & \texttt{exp7\_cbf} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Result: PASS.}
+\begin{itemize}
+    \item Both trajectories identical until $t \approx 10$\,s when
+          CBF begins activating
+    \item CBF run: abort triggered at $t \approx 15$\,s, drone
+          retreated safely and re-approached
+    \item No-CBF run: drone remained dangerously close to wall
+          with $M$ touching $M_\mathrm{abort}$ at $t \approx 21$\,s
+          and $t \approx 25$\,s with no recovery
+    \item $M$ curves diverge clearly after $t \approx 10$\,s,
+          confirming the CBF is actively modifying behavior
+\end{itemize}
+
+% -------------------------------------------------------
+\section{Challenges Encountered}
+% -------------------------------------------------------
+
+\subsection{CBF Zero Gradient at Level Flight}
+
+The first CBF implementation used a \texttt{cvxpy} QP with thrust
+and torque as decision variables. The wall clearance constraint was:
+
+\begin{equation}
+    \left[\frac{\sin\theta}{m},\; 0\right] u \geq \text{RHS}
+\end{equation}
+
+When $\theta = 0$, $\sin\theta = 0$, making the left-hand side
+identically zero regardless of $u$. The QP returned the nominal
+input unchanged in all cases. The fix was to abandon the QP approach
+and instead implement the CBF directly as a pitch angle limiter,
+which operates at the correct level of the cascaded controller
+architecture.
+
+\subsection{Drone Passing Through Wall}
+
+Early runs showed the drone's $x$ coordinate exceeding $x_w = 2.0$\,m
+during abort maneuvers. This occurred because the abort retreat
+generated a large overshoot that flung the drone past the wall. Two
+fixes were applied:
+
+\begin{enumerate}
+    \item A wall clamp was added to \texttt{dynamics.py} to prevent
+          $x$ from exceeding $x_w - d_{\min}$
+    \item The retreat target was changed from $x_\mathrm{retreat}
+          = 1.2$\,m to $1.5$\,m to reduce overshoot
+\end{enumerate}
+
+\subsection{Abort Not Preventing Re-approach}
+
+After the first abort and retreat, the approach lambda
+$x_\mathrm{des}(t) = \min(x_\mathrm{stop},\; x_\mathrm{start}
++ v_\mathrm{approach} \cdot t)$ continued advancing during the
+retreat, causing the drone to immediately re-approach the wall once
+$M$ recovered. The fix was an \texttt{abort\_triggered} flag that
+freezes the target at $x_\mathrm{retreat}$ until $M$ recovers
+sufficiently above $M_\mathrm{safe}$.
+
+\subsection{T\_safe Dropping to Zero}
+
+Early CBF gain values of $\gamma = 2.0$ caused $T_\mathrm{safe}$ to
+drop to zero when the drone was very close to the wall. This would
+have caused the drone to fall. The gains were reduced to
+$\gamma_d = 0.5$ and $\gamma_v = 0.5$, which produces safe but
+non-zero thrust corrections.
+
+\subsection{Positive vs.\ Negative vx Sign Convention}
+
+During CBF verification, the test state used $v_x = -1.6$\,m/s
+expecting this to represent approach toward the wall. However the
+wall normal velocity is $v_n = -v_x$, so $v_x = -1.6$ actually
+means $v_n = +1.6$ (receding). The correct test state for approach
+uses $v_x = +1.6$\,m/s, giving $v_n = -1.6$ (closing).
+
+% -------------------------------------------------------
+\section{Final Parameter Values}
+% -------------------------------------------------------
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Parameter} & \textbf{Final Value} & \textbf{Description} \\
+\midrule
+\texttt{cbf\_gamma\_d}  & 0.5  & Wall clearance class-$\mathcal{K}$ gain \\
+\texttt{cbf\_gamma\_v}  & 0.5  & Velocity class-$\mathcal{K}$ gain \\
+\texttt{cbf\_gamma\_th} & 1.0  & Attitude class-$\mathcal{K}$ gain \\
+\texttt{cbf\_gamma\_u}  & 1.0  & Actuator class-$\mathcal{K}$ gain \\
+\texttt{M\_safe}        & 0.6  & CBF activates below this value \\
+\texttt{M\_dock}        & 0.4  & Docking mode entry \\
+\texttt{M\_abort}       & 0.15 & Abort and retreat triggered \\
+\texttt{x\_retreat}     & 1.5  & Retreat target position (m) \\
+\texttt{retreat\_speed} & 0.05 & Retreat approach speed (m/s) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% -------------------------------------------------------
+\section{Phase 2 Success Checklist}
+% -------------------------------------------------------
+
+\begin{center}
+\begin{tabular}{cl}
+\toprule
+\textbf{Status} & \textbf{Item} \\
+\midrule
+$\checkmark$ & \texttt{cvxpy} installs and imports without error \\
+$\checkmark$ & \texttt{state\_machine.py} shell test passes all four
+               modes \\
+$\checkmark$ & \texttt{cbf.py} shell test shows
+               \texttt{cbf\_active=True} near wall \\
+$\checkmark$ & Experiment 5 runs to completion with no errors \\
+$\checkmark$ & All four mode transitions observed in Experiment 5 \\
+$\checkmark$ & Drone never crosses $d_{\min}$ with CBF on \\
+$\checkmark$ & Abort retreat and $M$ recovery working correctly \\
+$\checkmark$ & Experiment 6 shows all four mode transitions under
+               faster approach \\
+$\checkmark$ & Multiple complete approach-abort-retreat cycles
+               observed \\
+$\checkmark$ & Experiment 7 shows CBF prevents unsafe wall proximity
+               \\
+$\checkmark$ & No-CBF run shows $M$ touching $M_\mathrm{abort}$
+               without recovery \\
+$\checkmark$ & All experiment logs saved as \texttt{.npz} files \\
+$\checkmark$ & Mode transition plot saved to \texttt{plots/} \\
+$\checkmark$ & CBF vs.\ No-CBF comparison plot saved to
+               \texttt{plots/} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% -------------------------------------------------------
+\section{Notes for Phase 3}
+% -------------------------------------------------------
+
+Phase 3 moves from 2D planar simulation to a full 3D model and
+begins preparation for hardware integration with the PX4 autopilot
+stack. The following Phase 2 outputs feed directly into Phase 3:
+
+\begin{itemize}
+    \item The CBF pitch angle limiter architecture is directly
+          extensible to 3D by adding roll and yaw barrier functions
+          alongside the existing pitch barrier.
+    \item The calibrated $M$ thresholds
+          ($M_\mathrm{safe} = 0.6$, $M_\mathrm{dock} = 0.4$,
+          $M_\mathrm{abort} = 0.15$) carry over unchanged.
+    \item The state machine mode structure carries over unchanged.
+          Only the transition logic needs extension for 3D attitude.
+    \item Experiment 7 data provides the baseline for comparing
+          simulation CBF performance against hardware performance
+          in Phase 4.
+\end{itemize}
+
+\textbf{Key limitations to address in Phase 3:}
+
+\begin{itemize}
+    \item The 2D planar model does not capture roll dynamics or
+          lateral wall effects. These will become significant in
+          hardware testing.
+    \item The CBF currently modifies only torque. In 3D, thrust
+          vectoring effects will require thrust modification as well.
+    \item The z-axis drift observed throughout Phase 2 (z settling
+          at 1.58\,m instead of 1.5\,m) is caused by wall-induced
+          thrust modification $\Gamma(d)$. A feedforward compensation
+          term should be added in Phase 3.
+    \item The Gazebo simulation environment and PX4 SITL stack should
+          be installed before beginning Phase 3.
+\end{itemize}
+
+\end{document}

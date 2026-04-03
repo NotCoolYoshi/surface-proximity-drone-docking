@@ -1,0 +1,495 @@
+================================================================================
+SURFACE-PROXIMATE DRONE DOCKING — PROJECT PROGRESS
+Phases 1 & 2 Complete
+Sean Dai, Arizona
+================================================================================
+
+This document summarizes the work done in Phases 1 and 2 of the drone docking
+project. If you're reading this trying to understand what I was trying to build, why certain
+decisions were made, or how to reproduce the work yourself (would definitely wait until I 
+post updates on hardware testing lol), this is the right place to start. The full mathematical 
+derivations live in the LaTeX reports you can download (phase1_report.tex and phase2_report.tex). 
+This file is the plain-English version of those — still technical, but without the nasty mathematics.
+
+--------------------------------------------------------------------------------
+THE CORE IDEA
+--------------------------------------------------------------------------------
+
+Flying a drone close to a wall is genuinely harder than it sounds. As soon as a
+rotor gets within about half a meter of a surface, two things happen that most
+controllers aren't built to handle:
+
+1. The wall creates a pressure gradient that attracts the drone toward it — the
+   aerodynamic equivalent of ground effect, but sideways. This is modeled as
+   f_wall in the code: a distance-dependent force that grows nonlinearly as the
+   drone closes in.
+
+2. The wall reflects rotor wash back into the rotors, which boosts effective
+   thrust by up to 10% at close range. This is modeled as Gamma(d) = 1 + alpha
+   * exp(-beta * d). A 10% thrust boost doesn't sound like much until you
+   realize the altitude loop was tuned to hold hover at 1.0*mg: now the same
+   command produces 1.1*mg of lift and the drone slowly climbs.
+
+Conventional PID controllers don't model either of these effects. They just
+fight the perturbation reactively. The result is oscillation, drift, and
+eventually a crash or failed docking attempt.
+
+This project's approach: model both effects explicitly, build a metric (the
+Dockability Margin M) that tells you in real time how close to instability you
+are, and layer a safety filter (the CBF) on top of the existing controller that
+slows you down before things get dangerous — but only when actually necessary.
+
+--------------------------------------------------------------------------------
+PHASE 1 — BUILDING THE FOUNDATION
+--------------------------------------------------------------------------------
+
+Phase 1 was entirely simulation. No hardware, no flight controller, no ROS.
+Just Python running a mathematical model of the drone on a laptop.
+
+THE STATE VECTOR
+
+The drone is modeled as a rigid body in 2D (the vertical plane containing the
+wall-approach direction). Six numbers fully describe its state at any moment:
+
+    x      = horizontal position (positive = toward wall)
+    z      = altitude
+    vx     = horizontal velocity
+    vz     = vertical velocity
+    theta  = pitch angle (nose tilt)
+    thdot  = pitch rate
+
+This is a simplification of the full 6-DOF problem, but it captures all the
+dynamics that matter for a wall approach: how close you are, how fast you're
+closing, and how stable your attitude is. Roll and yaw are deliberately excluded
+in Phase 1 (they come back in Phase 3 with the 3D extension so don't quit on me yet!).
+
+THE EQUATIONS OF MOTION
+
+Four equations govern how the state evolves:
+
+    m * dvx/dt = -T_eff * sin(theta) + f_wall / m
+    m * dvz/dt =  T_eff * cos(theta) - g
+    I * d²theta/dt² = tau
+
+T_eff is the wall-modified thrust: T_eff = T * Gamma(d). The f_wall term has
+three components - pressure attraction (c0), viscous damping proportional to
+closing speed (c1), and a nonlinear drag term (c2) that grows with the square
+of closing speed. These three terms correspond to real aerodynamic phenomena:
+static pressure buildup, shear-viscous effects, and recirculation turbulence.
+
+In code, this all lives in dynamics.py. The derivatives() function implements
+these equations and is called by scipy's solve_ivp (RK45 integrator) at every
+timestep. One important note: the integrator calls derivatives() many times per
+timestep for its internal substep calculations. Any side effects (like logging
+or state clamping) placed inside derivatives() will fire multiple times per
+logged timestep and produce garbage. Logging goes in the ode() callback inside
+run_sim.py, not in dynamics.py.
+
+THE CONTROLLER
+
+The controller (controller.py) is a cascaded PD — two nested feedback loops.
+
+OUTER LOOP: Given where you are and where you want to be, compute what thrust
+and pitch angle you need. The vertical channel computes thrust directly:
+
+    T = m * (g + kp_z*(z_des - z) + kd_z*(0 - vz))
+
+The horizontal channel computes a desired pitch angle by figuring out what
+horizontal acceleration is needed, then converting that to tilt angle via the
+small-angle relationship:
+
+    ax_des   = kp_x*(x_des - x) + kd_x*(0 - vx)
+    theta_des = -(m * ax_des) / T
+
+The negative sign here is critical and took a while to get right (see Challenges
+below). Getting this wrong caused the drone to accelerate to 450m (yes you read that right, 450m) horizontally
+in the first test run.
+
+INNER LOOP: Given the desired pitch angle from the outer loop, compute the
+torque needed to get there:
+
+    tau = I * (kp_th*(theta_des - theta) + kd_th*(0 - thdot))
+
+The key design rule is that the inner loop must be significantly faster than the
+outer loop. In practice, kp_th = 15.0 while kp_x = 2.0 — a ratio of 7.5:1.
+If this ratio drops below about 3:1, the two loops interact at similar
+timescales and you get sustained oscillations that never settle.
+
+Tuning took over 15 simulation runs. The final values that hit the 5 cm hover
+criterion within 8 seconds are in params.py.
+
+THE DOCKABILITY MARGIN
+
+This is the original contribution of the project. M is a scalar between 0 and 1
+that summarizes the overall safety state of the drone during a wall approach.
+It's defined as the minimum of six normalized sub-margins:
+
+    M = min(Md, Mv, Mdelta, Momega, Mu, Mr)
+
+Each sub-margin measures something different:
+
+    Md     = how far you are from the wall vs. how far you need to be
+    Mv     = how fast you're closing vs. the maximum safe speed
+    Mdelta = how tilted you are vs. the maximum allowable tilt for docking
+    Momega = how fast you're rotating vs. the oscillation instability threshold
+    Mu     = how much thrust headroom you have left before saturation
+    Mr     = how much the wall is distorting your thrust vs. your model's
+             prediction (the disturbance residual)
+
+All six use the saturation function sat(x) = min(1, max(0, x)) to keep values
+between 0 and 1. When any sub-margin hits zero, M hits zero, and the system
+knows it's in a critical state. The minimum operator means the worst individual
+condition sets the overall margin — you can't be "overall safe" if any one
+dimension is violated.
+
+The code lives in margin.py. compute_margins() takes the current state vector,
+commanded thrust, and effective thrust as inputs and returns M plus all six
+sub-margins individually for logging.
+
+PHASE 1 RESULTS
+
+Four experiments were run:
+
+Exp 1 (free hover): Controller converges to within 5 cm in both axes within 8
+seconds. z converges almost instantly; x takes longer because kd_x is high to
+prevent wall overshoot. PASS.
+
+Exp 2 (near-wall hover): Wall force is negative (attractive) everywhere. Gamma
+reaches 1.10 at d=0.28m — a real 10% thrust boost. Drone oscillates visibly but
+controller holds position. fwall shows a hysteresis loop in the d vs force plot
+because the velocity-dependent c1 term makes the force stronger during approach
+than during retreat at the same distance. PASS.
+
+Exp 3 (constant-speed approach): M decreases from ~0.7 to ~0.15 during the
+approach. Md is the dominant sub-margin driving the decrease, as expected —
+clearance is the first thing to go as you get closer. PASS.
+
+Exp 4 (disturbance sensitivity): Surprisingly, the double-strength disturbance
+(c0=1.6, c1=0.6, c2=0.2) produced higher M oscillations than default — the
+stronger wall force caused stronger controller corrections that kept the drone
+further from the wall in a limit cycle. The default disturbance was more
+dangerous because it pushed the drone slowly and consistently toward the wall
+without triggering strong enough oscillatory corrections. This is a non-obvious
+result with real implications for hardware calibration. PASS.
+
+(The experiments are marked out in the file, and if you want to collect data on 
+a specific one, just mark out all but the one you want to call.)
+
+PHASE 1 CHALLENGES
+
+Sign error in horizontal controller: The original theta_des line was missing a
+negative sign. Fixed. Drone went to 450m before the fix, converged to target
+after.
+
+Tmax too small: Original Tmax = 2*m*g = 19.62N. At hover, T = m*g = 9.81N,
+which is exactly 50% of Tmax, leaving Mu = 0.50. This looked wrong — M was
+starting at 0.5 instead of near 1.0 for a drone just sitting in free air. Fix:
+doubled Tmax to 4*m*g = 39.24N, giving Mu = 0.75 at hover with meaningful
+headroom.
+
+Experiment 3 approach direction: The lambda function was subtracting v_approach
+instead of adding it, causing the target to move away from the wall. One sign
+character fix.
+
+Module caching: Python caches imported modules. Edits to dynamics.py won't take
+effect until the interpreter is restarted or importlib.reload() is called.
+Wasted several debugging sessions before this was identified.
+
+--------------------------------------------------------------------------------
+PHASE 2 — ADDING THE SAFETY LAYER
+--------------------------------------------------------------------------------
+
+Phase 2 kept everything from Phase 1 intact and added two new components:
+a state machine that classifies the drone's operating mode, and a CBF safety
+filter that modifies control inputs when the drone is in danger.
+
+THE STATE MACHINE
+
+state_machine.py implements a hybrid dynamical system with four modes:
+
+    free     (M >= 0.6)  : CBF inactive, controller navigates freely
+    surface  (M <  0.6)  : CBF active, permissive corrections only
+    docking  (M <  0.4)  : CBF active, tighter speed limiting
+    abort    (M <  0.15) : Controller overridden, retreat to d_safe boundary
+
+Mode transitions use 0.05 hysteresis — you don't re-enter free mode until M
+rises to 0.65, not just above 0.6. This prevents chattering (rapid toggling
+between modes) at threshold boundaries, which would cause noisy torque commands.
+
+The abort mode is the only one where the CBF takes position authority away from
+the controller. In all other modes, the controller's intended approach direction
+is preserved (the CBF only adds corrections, never reverses direction).
+
+THE CBF DESIGN PROCESS
+
+The original plan was to implement a full quadratic program (QP) using cvxpy:
+
+    min_u  ||u - u_nom||²
+    s.t.   h_dot_i(x, u) + gamma * h_i(x) >= 0  for each barrier
+
+This is the mathematically rigorous CBF-QP formulation from the literature. It
+failed immediately because at theta=0 (level flight), sin(theta) = 0, which
+makes the wall-related barrier gradient identically zero. The QP had no way to
+enforce safety through thrust when the drone is flying level. The constraint
+was trivially satisfied regardless of control input.
+
+The fix was to move the CBF to the outer loop level, operating directly on the
+desired pitch angle rather than on thrust and torque. Since pitch angle directly
+commands horizontal acceleration, this is the physically correct place to enforce
+wall safety. The barrier function becomes: don't let the drone close faster than
+a speed-limited threshold:
+
+    vn_floor = max(-gamma_d * (d - d_min), -vn_max)
+
+If the current closing speed exceeds vn_floor, compute the required deceleration,
+convert it to a safe pitch angle, and compute the torque needed to reach that
+angle via the inner loop. Thrust stays unchanged.
+
+THE FINAL CBF ARCHITECTURE (VERSION 4 — PERMISSIVE)
+
+After several iterations (documented in the design iterations section of the
+README), the CBF was redesigned with four layers:
+
+Layer 1/2: Completely inactive outside d_safe. If the wall hasn't been
+"detected" (d > 2.0m), nothing happens. This mirrors the hardware design where
+the Livox LiDAR arms the system when the wall enters its detection range.
+
+Layer 3a (progressive speed limiting): The permitted closing speed scales
+linearly with M:
+
+    v_limit = vn_max * (M - M_abort) / (M_safe - M_abort)
+
+At M=0.6 (just entering surface mode), the drone can close at full vn_max.
+As M drops toward 0.15, the limit tapers to zero. The drone naturally slows
+as it approaches, so abort is only needed for genuine instability — not just
+because the approach was fast.
+
+Layer 3b (angular rate damping): When |thdot| > omega_cbf_thresh, add a
+damping torque to suppress wall-induced oscillations. This directly counteracts
+the primary wall aerodynamic effect — oscillatory attitude instability.
+
+Layer 3c (thrust saturation guard): When T is near T_max, nudge toward level
+flight to free up thrust headroom for altitude hold.
+
+Layer 4 (abort): Hard override when M < M_abort. The position controller target
+is redirected to x_retreat = wall_x - d_safe. The CBF itself passes the
+controller inputs through unchanged in abort — the controller handles the retreat
+correctly once its target is redirected. Adding extra torque corrections on top
+of the controller during abort caused theta runaway in earlier versions.
+
+THE CRITICAL SIGN ERRORS
+
+Two sign errors each caused the drone to crash into the wall or behave
+erratically. Both are documented because they're easy to repeat:
+
+Error 1 — CBF abort torque sign: The abort layer originally added
+tau_abort = -gamma * proximity * 0.3. The intent was to push the drone away
+from the wall. With the dynamics convention ax = -(T/m)*sin(theta), a positive
+theta produces negative ax (deceleration). So a negative tau in abort was
+driving theta negative — pushing the drone INTO the wall at close range.
+Fixed by removing the extra torque entirely and letting the controller handle
+retreat unmodified.
+
+Error 2 — vx sign convention in CBF verification test: The test used
+vx = -1.6 m/s expecting this to mean "approaching the wall." But the wall
+normal velocity is vn = -vx, so vx = -1.6 actually means vn = +1.6 (receding).
+The correct test for approach uses vx = +1.6, giving vn = -1.6 (closing).
+
+PHASE 2 RESULTS
+
+Experiment 5 (CBF activation): Four mode transitions observed correctly in
+sequence. Drone never crossed d_min. Multiple approach-abort-retreat cycles
+completed in 35 seconds. PASS.
+
+Experiment 6 (state machine): All transitions at correct M thresholds. Two
+complete abort cycles in 30 seconds. PASS.
+
+Experiment 7 (CBF vs No-CBF): The key result of Phase 2. Both runs are
+numerically identical before abort fires (max diff = 0.00094m — confirming CBF
+does not interfere with deliberate approach). After abort fires, the CBF drone
+retreats ~1m and M recovers to above M_safe. The No-CBF drone oscillates near
+the wall indefinitely with M touching M_abort repeatedly and no recovery.
+
+Monte Carlo (50 trials): The Phase 2 milestone. 50 trials with randomised
+starting position, velocity, altitude, tilt, and angular rate. CBF wall
+violations: 0/50. All 50 abort events recovered M above M_safe. Strongest
+result: the clearance gain plot shows CBF improved safety uniformly across the
+entire init space — no region where CBF made things worse.
+
+PHASE 2 CHALLENGES (beyond the sign errors above)
+
+cvxpy QP failing at level flight: Described above. Abandoned the QP approach
+entirely in favor of the outer-loop pitch angle limiter.
+
+Drone passing through wall: Early abort maneuvers generated enough overshoot
+that x exceeded wall_x. Fixed with a post-integration wall clamp in run_sim.py:
+any logged x position is clamped to wall_x - d_min after solve_ivp returns.
+
+Abort not preventing re-approach: The moving approach target continued
+advancing during the retreat, so once M recovered the drone immediately hit
+the same wall again. Fixed with the abort_triggered flag that freezes the
+controller target at x_retreat until M recovers above M_safe + hysteresis.
+
+M_ABORT_BUFFER overreach: A 0.045 M-unit early trigger was added to compensate
+for RK45 integration latency (the integrator needs ~200ms to respond to a
+controller redirect). But 0.195 is inside docking mode — a deliberate approach
+was being treated as an emergency. The correct fix was progressive speed limiting
+in Layer 3a so M falls more slowly in the first place, eliminating the need for
+an early buffer entirely.
+
+--------------------------------------------------------------------------------
+HOW THE FILES FIT TOGETHER
+--------------------------------------------------------------------------------
+
+If you want to follow along or reproduce this work, here is the execution order
+and data flow:
+
+1. params.py
+   Read this first. Every numerical constant in the simulation is here with
+   inline comments explaining what it does. Run it directly (python params.py)
+   for a self-check that prints derived quantities and verifies threshold ordering.
+
+2. dynamics.py
+   The physics engine. derivatives() is the function scipy calls at each
+   integration substep. compute_wall_force() and compute_gamma() are helpers
+   for logging that compute the same quantities outside the ODE loop.
+
+3. controller.py
+   The CascadedPD class. Instantiate with (x_des, z_des). Call compute(state,
+   params) to get (T, tau). Call update_target(x_des, z_des) to change the
+   target mid-simulation (used for moving targets and abort redirect).
+
+4. margin.py
+   compute_margins(state, T_cmd, T_predicted, params) returns (M, subs_dict).
+   T_cmd is what the controller asked for. T_predicted is T_cmd * Gamma(d),
+   the effective thrust after wall modification. The difference between the
+   two is what drives the disturbance residual sub-margin Mr.
+
+5. state_machine.py
+   StateMachine(params). Call update(M, state, params) at each timestep to
+   get the current mode string. The class maintains mode internally. Important:
+   never call this inside the RK45 ODE substeps — mode changes mid-substep will
+   corrupt the integration. Call it once per logged timestep in the ode() callback.
+
+6. cbf.py
+   CBFFilter(params). Call filter(state, T_nom, tau_nom, params, mode, M)
+   to get (T_safe, tau_safe, cbf_active). The mode string and M value from steps
+   4 and 5 must be passed in. The CBF uses M directly for the progressive speed
+   limit calculation — it has no way to compute M internally.
+
+7. logger.py
+   Logger(). Call log() once per timestep with all quantities. Call save() after
+   the simulation ends to write a timestamped .npz file to data/.
+
+8. run_sim.py
+   The entry point that ties everything together. The run() function contains
+   the ode() inner function that calls all of the above in the correct order
+   every timestep. All experiments are defined at the bottom as commented blocks.
+   Uncomment one, run python run_sim.py.
+
+9. monte_carlo.py
+   Standalone script. Imports from all the above. Runs 50 randomised trials and
+   produces the milestone verification report. Run python monte_carlo.py.
+
+10. visualize.py
+    Plotting functions. load(path) returns a dict from a .npz file. Then call
+    any of plot_trajectory(), plot_margins(), plot_disturbance(),
+    plot_hover_error(), plot_modes() with that dict.
+
+--------------------------------------------------------------------------------
+PARAMETER VALUES — FINAL STATE AFTER PHASE 2
+--------------------------------------------------------------------------------
+
+These are the values currently in params.py. Phase 1 calibrated most of them.
+Phase 2 added the CBF parameters and increased d_safe from 0.80m to 2.0m.
+
+Vehicle:
+    m = 1.0 kg          (simulation; real hardware will be ~2 kg — update before flight)
+    I = 0.015 kg*m²
+    g = 9.81 m/s²
+    T_max = 39.24 N     (= 4*m*g, gives Mu = 0.75 at hover)
+
+Wall disturbance (estimates — replace with measured values after Phase 3 sys ID):
+    alpha = 0.15        thrust modification strength
+    beta  = 1.5 m⁻¹    thrust modification decay rate
+    lam   = 2.0 m⁻¹    disturbance force decay rate
+    c0    = 0.8 N       pressure attraction coefficient     # REPLACE
+    c1    = 0.3 N·s/m  viscous damping coefficient         # REPLACE
+    c2    = 0.1 N·s²/m² nonlinear drag coefficient         # REPLACE
+
+Controller gains:
+    kp_z = 8.0,  kd_z = 4.0
+    kp_x = 2.0,  kd_x = 10.0
+    kp_th = 15.0, kd_th = 15.0
+
+Margin thresholds:
+    d_min   = 0.05 m    hard collision boundary
+    d_safe  = 2.0 m     CBF activation boundary
+    vn_max  = 1.5 m/s   max approach speed (for Mv sub-margin)
+    M_safe  = 0.6       free → surface mode
+    M_dock  = 0.4       surface → docking mode
+    M_abort = 0.15      abort and retreat
+
+CBF parameters:
+    cbf_gamma_d      = 0.5     class-K gain for progressive speed limit
+    vn_cbf_thresh    = 0.8 m/s Layer 3a activation threshold
+    omega_cbf_thresh = 1.2 rad/s Layer 3b activation threshold
+
+--------------------------------------------------------------------------------
+WHAT IS AND ISN'T PROVEN BY THE SIMULATION
+--------------------------------------------------------------------------------
+
+The simulation proves:
+- The Dockability Margin correctly quantifies proximity to instability in the
+  2D planar model with the estimated disturbance coefficients.
+- The CBF safety filter prevents wall collision across 50 randomised initial
+  conditions in that same 2D model.
+- The progressive speed limiting keeps M from collapsing during deliberate
+  approach — abort is genuinely a last resort, not a routine event.
+- The state machine transitions are correct and hysteresis prevents chattering.
+
+The simulation does NOT prove:
+- That the disturbance model is accurate. c0, c1, c2 are estimates. Phase 3
+  system identification will replace them with measured values.
+- That the 2D results transfer to 3D. Roll, yaw, and lateral wall effects are
+  not modeled. Phase 3 extends to 3D.
+- That the controller gains from simulation will work on real hardware. The
+  real drone will have structural resonances, sensor noise, actuator lag, and
+  communication delays that the simulation ignores.
+- That the 200ms RK45 integration latency corresponds to real control loop
+  latency. On the Jetson + PX4 stack the actual latency will differ and the
+  abort trigger timing may need re-tuning.
+
+--------------------------------------------------------------------------------
+NEXT STEPS (PHASE 3 AND BEYOND)
+--------------------------------------------------------------------------------
+
+Phase 3 is hardware. The key items I will be adding before any flight testing:
+
+1. Update m in params.py to match the real all-up weight (~2 kg). This affects
+   T_max, the hover thrust, and every sub-margin that involves thrust. Running
+   hardware tests with m=1.0 will cause the margins to be miscalibrated.
+
+2. Run the system identification experiment. Hover at d = 0.3m, 0.5m, 0.8m,
+   1.2m. Log commanded thrust and IMU-measured acceleration at each position.
+   Fit the residual acceleration to the c0, c1, c2 model. Update params.py.
+
+3. Write the MAVLink interface. The Python simulation sends T and tau directly
+   to the dynamics model. On hardware, the Jetson sends attitude setpoints to
+   PX4 via MAVLink (pymavlink or MAVSDK). The translation layer between the
+   CBF output and PX4 setpoint commands doesn't exist yet.
+
+4. Build the LiDAR wall detection pipeline. The simulation assumes d is known
+   perfectly. On hardware, d comes from fitting a plane to the Livox Mid-360
+   point cloud in real time. This needs to run fast enough to feed the margin
+   estimator at >50 Hz.
+
+5. Tether first flights. Never untethered near the wall until hover at 0.5m
+   is confirmed stable for 10+ minutes with M being logged from real sensors.
+
+Phase 4 is validation: 30 docking trials vs the ETH Zurich ±10 cm scatter
+benchmark and a portfolio write-up.
+
+================================================================================
+END OF PROGRESS SUMMARY
+================================================================================

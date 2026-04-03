@@ -1,0 +1,515 @@
+\documentclass[12pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{graphicx}
+\usepackage{float}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue
+}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    backgroundcolor=\color{gray!10},
+    frame=single,
+    breaklines=true,
+    keywordstyle=\color{blue},
+    commentstyle=\color{green!60!black},
+    stringstyle=\color{orange}
+}
+
+\title{\textbf{Phase 1 Simulation Report} \\
+\large Surface-Proximate Drone Docking Project}
+\author{Sean Dai}
+\date{January 20th, 2026}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+% -------------------------------------------------------
+\section{Overview}
+% -------------------------------------------------------
+
+Phase 1 of the surface-proximate drone docking project established a
+complete Python simulation environment for a 2D planar quadrotor operating
+near a vertical wall. No hardware was used. All work ran on a laptop using
+\texttt{numpy}, \texttt{scipy}, and \texttt{matplotlib}.
+
+The three core goals of Phase 1 were:
+
+\begin{enumerate}
+    \item Verify stable free-air hover with position error below 5\,cm.
+    \item Confirm that wall disturbance terms produce a visible perturbation
+          on the drone trajectory.
+    \item Demonstrate that the Dockability Margin $M$ decreases as the drone
+          approaches the wall and responds correctly to disturbance strength.
+\end{enumerate}
+
+All three goals were achieved by the end of Phase 1.
+
+% -------------------------------------------------------
+\section{File Structure and Responsibilities}
+% -------------------------------------------------------
+
+The simulation was organized into seven files, each with a single
+well-defined responsibility.
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{File} & \textbf{Responsibility} \\
+\midrule
+\texttt{params.py}     & All numerical constants in one dictionary \\
+\texttt{dynamics.py}   & Equations of motion and wall disturbance model \\
+\texttt{controller.py} & Cascaded PD nominal controller \\
+\texttt{margin.py}     & Dockability Margin and six sub-margin computations \\
+\texttt{logger.py}     & Per-timestep data logging and \texttt{.npz} saving \\
+\texttt{run\_sim.py}   & Simulation entry point and experiment configuration \\
+\texttt{visualize.py}  & All plotting functions \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% -------------------------------------------------------
+\section{System Model}
+% -------------------------------------------------------
+
+\subsection{State Representation}
+
+The drone is modeled as a rigid body in the vertical plane. The six-element
+state vector is:
+
+\begin{equation}
+    \mathbf{x} = \begin{bmatrix} x & z & v_x & v_z & \theta & \dot{\theta} \end{bmatrix}^\top
+\end{equation}
+
+where $x$ is horizontal position, $z$ is altitude, $v_x$ and $v_z$ are
+translational velocities, $\theta$ is pitch angle, and $\dot{\theta}$ is
+pitch rate.
+
+\subsection{Equations of Motion}
+
+The translational and rotational dynamics are:
+
+\begin{align}
+    m\dot{v}_x &= -T_\mathrm{eff}\sin\theta + f_\mathrm{wall}(d, v_n) \\
+    m\dot{v}_z &= T_\mathrm{eff}\cos\theta - mg \\
+    I\ddot{\theta} &= \tau
+\end{align}
+
+where the wall-modified effective thrust is:
+
+\begin{equation}
+    T_\mathrm{eff}(d) = T \cdot \Gamma(d), \qquad
+    \Gamma(d) = 1 + \alpha e^{-\beta d}
+\end{equation}
+
+and the wall disturbance force is:
+
+\begin{equation}
+    f_\mathrm{wall}(d, v_n) = -\left(c_0 e^{-\lambda d}
+    + c_1 e^{-\lambda d} v_n
+    + c_2 e^{-\lambda d} v_n |v_n|\right)
+\end{equation}
+
+Here $d = x_w - x$ is the signed distance to the wall and
+$v_n = -v_x$ is the wall-normal velocity (positive = receding).
+
+% -------------------------------------------------------
+\section{Controller Design}
+% -------------------------------------------------------
+
+\subsection{Cascaded PD Architecture}
+
+A two-level cascaded PD controller was implemented. The outer loop
+converts position errors into desired pitch angle and thrust; the inner
+loop converts attitude error into torque.
+
+\textbf{Outer loop --- vertical channel:}
+\begin{align}
+    a_{z,\mathrm{des}} &= k_{p,z}(z_\mathrm{des} - z) + k_{d,z}(0 - v_z) \\
+    T &= m(g + a_{z,\mathrm{des}}), \quad T \in [0, T_\mathrm{max}]
+\end{align}
+
+\textbf{Outer loop --- horizontal channel:}
+\begin{align}
+    a_{x,\mathrm{des}} &= k_{p,x}(x_\mathrm{des} - x) + k_{d,x}(0 - v_x) \\
+    \theta_\mathrm{des} &= -\frac{m \cdot a_{x,\mathrm{des}}}{T},
+    \quad \theta_\mathrm{des} \in [-\theta_\mathrm{max}, +\theta_\mathrm{max}]
+\end{align}
+
+\textbf{Inner loop --- attitude channel:}
+\begin{equation}
+    \tau = I\left(k_{p,\theta}(\theta_\mathrm{des} - \theta)
+    + k_{d,\theta}(0 - \dot{\theta})\right)
+\end{equation}
+
+\subsection{Final Tuned Gains}
+
+Significant gain tuning was required to achieve the 5\,cm hover criterion.
+The final values used are shown below.
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Parameter} & \textbf{Final Value} & \textbf{Description} \\
+\midrule
+$k_{p,z}$ & 8.0  & Vertical position P gain \\
+$k_{d,z}$ & 4.0  & Vertical velocity D gain \\
+$k_{p,x}$ & 2.0  & Horizontal position P gain \\
+$k_{d,x}$ & 10.0 & Horizontal velocity D gain \\
+$k_{p,\theta}$ & 15.0 & Pitch angle P gain \\
+$k_{d,\theta}$ & 15.0 & Pitch rate D gain \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% -------------------------------------------------------
+\section{Dockability Margin}
+% -------------------------------------------------------
+
+\subsection{Sub-Margin Definitions}
+
+The Dockability Margin $M \in [0,1]$ is the minimum of six normalized
+sub-margins, each computed via the saturation function
+$\mathrm{sat}(x) = \min(1, \max(0, x))$.
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Sub-margin} & \textbf{Formula} & \textbf{Measures} \\
+\midrule
+$M_d$ & $\mathrm{sat}\!\left(\dfrac{d - d_{\min}}{d_\mathrm{safe} - d_{\min}}\right)$ & Wall clearance \\[8pt]
+$M_v$ & $\mathrm{sat}\!\left(1 - \dfrac{\max(0,-v_n)}{v_{n,\max}}\right)$ & Approach speed \\[8pt]
+$M_\delta$ & $\mathrm{sat}\!\left(1 - \dfrac{|\theta|}{\delta_{\max}}\right)$ & Tilt alignment \\[8pt]
+$M_\omega$ & $\mathrm{sat}\!\left(1 - \dfrac{|\dot{\theta}|}{\omega_{\max}}\right)$ & Angular rate \\[8pt]
+$M_u$ & $\mathrm{sat}\!\left(1 - \dfrac{T_\mathrm{cmd}}{T_{\max}}\right)$ & Control authority \\[8pt]
+$M_r$ & $\mathrm{sat}\!\left(1 - \dfrac{|T_\mathrm{eff} - T_\mathrm{cmd}|/m}{r_{\max}}\right)$ & Disturbance residual \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{equation}
+    M = \min\{M_d,\, M_v,\, M_\delta,\, M_\omega,\, M_u,\, M_r\}
+\end{equation}
+
+\subsection{Calibrated Thresholds}
+
+Based on Experiment 3 results, the following thresholds were calibrated:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Threshold} & \textbf{Value} & \textbf{Meaning} \\
+\midrule
+$M_\mathrm{safe}$  & 0.6  & CBF layer activates below this value \\
+$M_\mathrm{dock}$  & 0.4  & Docking mode entry \\
+$M_\mathrm{abort}$ & 0.15 & Abort and retreat triggered \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% -------------------------------------------------------
+\section{Experiments and Results}
+% -------------------------------------------------------
+
+\subsection{Experiment 1 --- Free-Air Hover}
+
+\textbf{Purpose:} Verify the controller and dynamics work correctly before
+adding wall effects.
+
+\textbf{Setup:} Target $(x, z) = (1.0, 1.5)$\,m, initial state
+$(1.2, 1.5)$\,m, \texttt{wall\_on=False}, duration 15\,s.
+
+\textbf{Result: PASS.}
+\begin{itemize}
+    \item $x$ error entered the 5\,cm threshold at approximately $t = 4$\,s.
+    \item $z$ error remained below 5\,cm for the entire run
+          (sub-millimeter steady state).
+    \item Thrust at steady-state hover $\approx 9.81$\,N $= mg$.
+    \item No sustained oscillation observed after $t = 4$\,s.
+\end{itemize}
+
+\subsection{Experiment 2 --- Near-Wall Hover}
+
+\textbf{Purpose:} Verify that wall disturbance terms produce a visible
+perturbation and that the controller responds correctly.
+
+\textbf{Setup:} Target $(x, z) = (1.8, 1.5)$\,m, \texttt{wall\_on=True},
+duration 20\,s. Wall at $x_w = 2.0$\,m, giving $d \approx 0.2$\,m.
+
+\textbf{Result: PASS.}
+\begin{itemize}
+    \item $f_\mathrm{wall}$ was negative throughout, confirming wall
+          attraction force.
+    \item $f_\mathrm{wall}$ magnitude increased as $d$ decreased, ranging
+          from $-0.30$\,N at $d = 0.45$\,m to $-0.50$\,N at $d = 0.28$\,m.
+    \item $\Gamma > 1.0$ everywhere in the range, reaching $\approx 1.10$
+          at closest approach.
+    \item Drone trajectory showed visible oscillation caused by the
+          disturbance force, confirming the wall effect is active.
+\end{itemize}
+
+\subsection{Experiment 3 --- Constant-Speed Wall Approach}
+
+\textbf{Purpose:} Verify that $M$ responds correctly during a controlled
+wall approach.
+
+\textbf{Setup:} Moving target $x_\mathrm{des}(t) = \min(x_\mathrm{stop},\,
+1.5 + 0.05t)$, $z_\mathrm{des} = 1.5$\,m, \texttt{wall\_on=True},
+duration 25\,s.
+
+\textbf{Result: PASS.}
+\begin{itemize}
+    \item $M$ showed a clear general downward trend from $\approx 0.7$
+          at $t = 0$ to $\approx 0.15$ near the wall.
+    \item $M_d$ (clearance) was the dominant sub-margin driving the decrease.
+    \item $M$ crossed all three threshold lines ($M_\mathrm{safe}$,
+          $M_\mathrm{dock}$, $M_\mathrm{abort}$) during the approach.
+\end{itemize}
+
+\subsection{Experiment 4 --- Sensitivity to Disturbance Strength}
+
+\textbf{Purpose:} Verify that $M$ responds correctly to different
+disturbance levels and that $M_r$ is most sensitive to disturbance strength.
+
+\textbf{Setup:} Three runs with the same approach profile but different
+disturbance coefficients:
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+\textbf{Run} & $c_0$ & $c_1$ & $c_2$ \\
+\midrule
+No disturbance    & 0.0 & 0.0 & 0.0 \\
+Default           & 0.8 & 0.3 & 0.1 \\
+Double strength   & 1.6 & 0.6 & 0.2 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Result: PASS.}
+\begin{itemize}
+    \item Default disturbance produced the smoothest and most monotonic
+          decrease in $M$, reaching $\approx 0.05$ at end of run.
+    \item Double disturbance caused large oscillations in $M$ between
+          $0.3$ and $0.75$, demonstrating that stronger disturbances
+          destabilize the margin.
+    \item No disturbance (green curve) overlapped with default at the
+          start, confirming the margin system correctly distinguishes
+          disturbance levels.
+\end{itemize}
+
+% -------------------------------------------------------
+\section{Challenges Encountered}
+% -------------------------------------------------------
+
+\subsection{Sign Error in Horizontal Controller}
+
+The most impactful bug discovered during Phase 1 was a sign error in the
+horizontal channel of the controller. The line:
+
+\begin{lstlisting}[language=Python]
+theta_des = (m * ax_des) / T
+\end{lstlisting}
+
+should have been:
+
+\begin{lstlisting}[language=Python]
+theta_des = -(m * ax_des) / T
+\end{lstlisting}
+
+The dynamics equation $m\dot{v}_x = -T\sin\theta$ requires a negative sign
+when converting desired acceleration to desired pitch angle. Without this
+fix, the drone drifted to over 450\,m horizontally instead of converging
+to the target.
+
+\subsection{Controller Gain Tuning}
+
+Achieving the 5\,cm hover criterion within 8\,s required extensive gain
+tuning across more than 15 simulation runs. The key challenge was the
+competing requirements of the cascaded loops:
+
+\begin{itemize}
+    \item Higher $k_{p,x}$ caused oscillations because the outer loop
+          competed with the inner loop at similar timescales.
+    \item Higher $k_{d,x}$ alone was insufficient to suppress oscillations
+          without also increasing $k_{d,\theta}$.
+    \item The final solution required making $k_{d,\theta} = 15.0$
+          significantly larger than its original value of 6.0, which
+          effectively decoupled the two loops by making the inner loop
+          much faster.
+\end{itemize}
+
+\subsection{Experiment 3 Approach Direction Bug}
+
+The initial Experiment 3 implementation used:
+
+\begin{lstlisting}[language=Python]
+x_des = lambda t: max(d_min + 0.02, x_start - v_approach * t)
+\end{lstlisting}
+
+which moved the target \emph{away} from the wall (decreasing $x$) instead
+of toward it. The fix was to change the sign and swap \texttt{max} for
+\texttt{min}:
+
+\begin{lstlisting}[language=Python]
+x_des = lambda t: min(x_stop, x_start + v_approach * t)
+\end{lstlisting}
+
+\subsection{Python Module Caching}
+
+Several debugging sessions were extended because changes to source files
+were not reflected in the running Python session due to module caching.
+The fix was always to either restart the Python interpreter or use
+\texttt{importlib.reload()} and to delete \texttt{\_\_pycache\_\_} when
+needed.
+
+\subsection{Dockability Margin Starting Below 1.0}
+
+The overall margin $M$ never started near 1.0 as expected because
+$M_u$ (control authority) was capped at $\approx 0.6$ even at rest.
+This is because the drone uses approximately half its available thrust
+just to hover against gravity. The fix was to double $T_\mathrm{max}$
+from 19.62\,N to 39.24\,N, giving the controller more headroom and
+raising $M_u$ to $\approx 0.75$ at hover.
+
+% -------------------------------------------------------
+\section{Final Parameter Values}
+% -------------------------------------------------------
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Parameter} & \textbf{Final Value} & \textbf{Description} \\
+\midrule
+$m$               & 1.0   & Vehicle mass (kg) \\
+$I$               & 0.01  & Pitch inertia (kg\,m$^2$) \\
+$g$               & 9.81  & Gravity (m/s$^2$) \\
+$T_\mathrm{max}$  & 39.24 & Max thrust (N) \\
+$x_w$             & 2.0   & Wall position (m) \\
+$\alpha$          & 0.15  & Thrust modification strength \\
+$\beta$           & 1.5   & Thrust modification decay rate (m$^{-1}$) \\
+$\lambda$         & 2.0   & Disturbance force decay rate (m$^{-1}$) \\
+$c_0$             & 0.8   & Pressure attraction coefficient (N) \\
+$c_1$             & 0.3   & Viscous damping coefficient (N\,s/m) \\
+$c_2$             & 0.1   & Nonlinear drag coefficient (N\,s$^2$/m$^2$) \\
+$d_{\min}$          & 0.05  & Minimum wall clearance (m) \\
+$d_\mathrm{safe}$ & 0.80  & Nominal safe distance (m) \\
+$v_{n,\max}$      & 1.5   & Max allowable approach speed (m/s) \\
+$\delta_{\max}$     & 0.349 & Max alignment error (rad) \\
+$\omega_{\max}$     & 2.0   & Max angular rate (rad/s) \\
+$r_{\max}$          & 2.0   & Disturbance residual threshold (m/s$^2$) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% -------------------------------------------------------
+\section{Notes for Phase 2}
+% -------------------------------------------------------
+
+\subsection{CBF Implementation}
+
+Phase 2 requires installing \texttt{cvxpy} for the quadratic program solver:
+
+\begin{lstlisting}[language=bash]
+pip install cvxpy
+\end{lstlisting}
+
+The CBF safety filter will receive the nominal control input
+$(T_\mathrm{nom}, \tau_\mathrm{nom})$ from \texttt{controller.py} and solve:
+
+\begin{equation}
+    \min_u \|u - u_\mathrm{nom}\|^2 \quad \text{subject to} \quad
+    \dot{h}_i(x, u) + \alpha_i(h_i(x)) \geq 0 \quad \forall i
+\end{equation}
+
+Barrier functions are needed for minimum wall clearance, maximum approach
+velocity, attitude limits, and actuator saturation.
+
+\subsection{State Machine Thresholds}
+
+The M thresholds calibrated in Phase 1 that will govern state machine
+transitions in Phase 2 are:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Threshold} & \textbf{Value} & \textbf{Trigger} \\
+\midrule
+$M_\mathrm{safe}$  & 0.6  & Enter surface-proximate mode, CBF activates \\
+$M_\mathrm{dock}$  & 0.4  & Enter docking mode \\
+$M_\mathrm{abort}$ & 0.15 & Abort and retreat from wall \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Known Limitations to Address}
+
+\begin{itemize}
+    \item The controller oscillates significantly in the presence of strong
+          wall disturbances. The CBF layer should suppress unsafe approach
+          velocities that cause these oscillations.
+    \item $M$ is not perfectly monotonic during approach due to controller
+          oscillations. Phase 2 should produce smoother M profiles because
+          the CBF limits approach velocity.
+    \item The current controller does not reach $d_{\min}$ before the
+          simulation ends. The docking mode in Phase 2 should handle the
+          final close-range approach more carefully.
+    \item The 2D planar model will need to be extended toward a 3D model
+          in later phases for hardware validation.
+\end{itemize}
+
+\subsection{Files to Create in Phase 2}
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{File} & \textbf{Responsibility} \\
+\midrule
+\texttt{cbf.py}           & CBF safety filter and QP solver \\
+\texttt{state\_machine.py} & Hybrid docking state machine \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Existing files \texttt{run\_sim.py}, \texttt{logger.py}, and
+\texttt{visualize.py} will also need updates to incorporate the new
+CBF and state machine outputs.
+
+% -------------------------------------------------------
+\section{Phase 1 Success Checklist}
+% -------------------------------------------------------
+
+\begin{center}
+\begin{tabular}{cl}
+\toprule
+\textbf{Status} & \textbf{Item} \\
+\midrule
+$\checkmark$ & Experiment 1 runs to completion with no errors \\
+$\checkmark$ & Hover position error $<$ 5\,cm in both $x$ and $z$ \\
+$\checkmark$ & Thrust at steady-state hover $\approx 9.81$\,N $= mg$ \\
+$\checkmark$ & $f_\mathrm{wall}$ is non-zero and negative in Experiment 2 \\
+$\checkmark$ & $\Gamma > 1.0$ at $d < 0.5$\,m in Experiment 2 \\
+$\checkmark$ & $M$ decreases during Experiment 3 \\
+$\checkmark$ & $M_d$ is the dominant sub-margin during approach \\
+$\checkmark$ & Experiment 4 shows stronger disturbance $\Rightarrow$ lower $M$ \\
+$\checkmark$ & All four experiment logs saved as \texttt{.npz} files \\
+$\checkmark$ & Plots saved to \texttt{plots/} directory \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}
